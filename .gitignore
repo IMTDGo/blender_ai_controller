@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Build / packaging artifacts
+*.zip
+dist/
+build/
+
+# Runtime temp produced by the add-on (lives in the system temp dir, listed for safety)
+blender_ai_view_*
+blender_ai_polyhaven/

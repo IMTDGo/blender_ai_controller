@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "blender_ai_controller"
+version = "4.0.0"
+name = "Blender AI Controller (Ollama)"
+tagline = "Copilot-style local-AI control for Blender via Ollama"
+maintainer = "Z1jay"
+type = "add-on"
+
+# Minimum Blender for the Extensions platform (4.2+). On 4.1 the legacy
+# bl_info in __init__.py is used instead.
+blender_version_min = "4.2.0"
+
+license = ["SPDX:MIT"]
+
+# Change this to your repository URL before publishing.
+website = "https://github.com/yourname/blender-ai-controller"
+
+tags = ["Object", "Material", "Lighting"]
+
+# This add-on talks to a local Ollama server and downloads free assets from
+# PolyHaven, and it runs AI-generated Python via exec(). These permissions are
+# declared for transparency.
+[permissions]
+network = "Connect to a local Ollama server and download free assets from PolyHaven"
+files = "Save downloaded assets and viewport screenshots to a temporary folder"
