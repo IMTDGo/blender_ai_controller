@@ -127,6 +127,10 @@ Attach that zip to a GitHub Release.
 
 ---
 
+## Author
+
+Z1jay — [instagram.com/z_jay_0723](https://instagram.com/z_jay_0723)
+
 ## License
 
 MIT — see [LICENSE](LICENSE). PolyHaven assets are CC0.

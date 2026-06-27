@@ -13,8 +13,7 @@ blender_version_min = "4.2.0"
 
 license = ["SPDX:MIT"]
 
-# Change this to your repository URL before publishing.
-website = "https://github.com/yourname/blender-ai-controller"
+website = "https://instagram.com/z_jay_0723"
 
 tags = ["Object", "Material", "Lighting"]
 
