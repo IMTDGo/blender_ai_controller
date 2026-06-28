@@ -40,7 +40,7 @@ Interaction:
 bl_info = {
     "name": "Blender AI Controller (Ollama)",
     "author": "Z1jay",
-    "version": (4, 4, 0),
+    "version": (4, 2, 0),
     "blender": (4, 1, 0),
     "location": "View3D > Sidebar (N) > AI",
     "description": "Copilot-style local-AI control for Blender via Ollama (Ask/Plan/Agent, with per-step vision).",
