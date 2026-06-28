@@ -40,7 +40,7 @@ Interaction:
 bl_info = {
     "name": "Blender AI Controller (Ollama)",
     "author": "Z1jay",
-    "version": (4, 1, 0),
+    "version": (4, 4, 0),
     "blender": (4, 1, 0),
     "location": "View3D > Sidebar (N) > AI",
     "description": "Copilot-style local-AI control for Blender via Ollama (Ask/Plan/Agent, with per-step vision).",
@@ -60,6 +60,7 @@ import os
 import tempfile
 import base64
 import math
+import hashlib
 import mathutils
 
 from bpy.props import (
@@ -351,6 +352,37 @@ def unload_model(name):
     _post("/api/generate", {"model": name, "keep_alive": 0})
 
 
+def get_capabilities(model):
+    """Query a model's capabilities via /api/show (e.g. completion, tools, vision, thinking)."""
+    try:
+        resp = _post("/api/show", {"model": model})
+        caps = resp.get("capabilities") or []
+        return [str(c) for c in caps]
+    except Exception:
+        return []
+
+
+def refresh_caps(st):
+    """Read the selected model's capabilities into the panel state. Main thread only."""
+    m = getattr(st, "model", "")
+    if not m or m == "__none__":
+        st.caps = ""
+        st.caps_known = False
+        st.model_vision = False
+        return
+    caps = get_capabilities(m)
+    st.caps = ", ".join(caps) if caps else "(unknown)"
+    st.caps_known = bool(caps)
+    st.model_vision = ("vision" in caps)
+
+
+def _on_model_change(self, context):
+    try:
+        refresh_caps(self)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Local memory / RAG (keyword retrieval; pure Python, no extra deps)
 #   - Seed KB shipped in kb/seed.jsonl
@@ -396,7 +428,7 @@ def _load_memory_items():
     return items
 
 
-def retrieve_memory(query, k=3):
+def retrieve_memory_keyword(query, k=3):
     qt = _tokens(query)
     if not qt:
         return []
@@ -434,18 +466,14 @@ def count_episodes():
         return 0
 
 
-def build_memory_context(pref_notes, user_input):
-    parts = []
-    notes = (pref_notes or "").strip()
-    if notes:
-        parts.append("User standing preferences (always follow):\n" + notes)
+def build_examples_context(user_input):
     eps = retrieve_memory(user_input, k=3)
-    if eps:
-        ex = "\n\n".join("# Past task: %s\n%s" % (e.get("prompt", ""), e.get("code", ""))
-                         for e in eps)
-        parts.append("Relevant examples that worked before on this machine "
-                     "(reuse patterns that fit, adapt as needed):\n" + ex)
-    return "\n\n".join(parts)
+    if not eps:
+        return ""
+    ex = "\n\n".join("# Past task: %s\n%s" % (e.get("prompt", ""), e.get("code", ""))
+                     for e in eps)
+    return ("Relevant examples that worked before on this machine "
+            "(reuse patterns that fit, adapt as needed):\n" + ex)
 
 
 def _get_prefs():
@@ -453,6 +481,156 @@ def _get_prefs():
         return bpy.context.preferences.addons[__name__].preferences
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Optional semantic retrieval via an Ollama embedding model.
+# Vector cache lives next to episodes.jsonl, keyed by embedding-model name.
+# ---------------------------------------------------------------------------
+def embed_text(model, text):
+    try:
+        resp = _post("/api/embed", {"model": model, "input": text})
+        embs = resp.get("embeddings")
+        if embs:
+            return embs[0]
+    except Exception:
+        pass
+    try:
+        resp = _post("/api/embeddings", {"model": model, "prompt": text})
+        e = resp.get("embedding")
+        if e:
+            return e
+    except Exception:
+        pass
+    return None
+
+
+def _emb_cache_path(model):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", model or "model")
+    return os.path.join(_mem_dir(), "emb_%s.json" % safe)
+
+
+def _load_emb_cache(model):
+    p = _emb_cache_path(model)
+    try:
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_emb_cache(model, cache):
+    try:
+        with open(_emb_cache_path(model), "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+def _hash(t):
+    return hashlib.sha1((t or "").encode("utf-8")).hexdigest()
+
+
+def retrieve_memory_semantic(query, model, k=3):
+    try:
+        import numpy as np
+    except Exception:
+        return []
+    items = _load_memory_items()
+    if not items:
+        return []
+    cache = _load_emb_cache(model)
+    dirty = False
+    vecs = []
+    kept = []
+    for it in items:
+        p = it.get("prompt", "")
+        if not p:
+            continue
+        h = _hash(p)
+        v = cache.get(h)
+        if v is None:
+            v = embed_text(model, p)
+            if v is None:
+                continue
+            cache[h] = v
+            dirty = True
+        vecs.append(v)
+        kept.append(it)
+    if dirty:
+        _save_emb_cache(model, cache)
+    if not kept:
+        return []
+    qv = embed_text(model, query)
+    if qv is None:
+        return []
+    try:
+        M = np.array(vecs, dtype=float)
+        q = np.array(qv, dtype=float)
+        Mn = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-9)
+        qn = q / (np.linalg.norm(q) + 1e-9)
+        sims = Mn @ qn
+        idx = list(np.argsort(-sims)[:k])
+        return [kept[i] for i in idx]
+    except Exception:
+        return []
+
+
+def retrieve_memory(query, k=3):
+    """Dispatch: semantic if an embedding model is configured & works, else keyword."""
+    prefs = _get_prefs()
+    model = getattr(prefs, "embed_model", "none") if prefs else "none"
+    if model and model not in ("none", ""):
+        try:
+            res = retrieve_memory_semantic(query, model, k)
+            if res:
+                return res
+        except Exception:
+            pass
+    return retrieve_memory_keyword(query, k)
+
+
+# Background pull of an embedding model via Ollama /api/pull
+_PULL = {"active": False, "status": "", "model": ""}
+
+
+def _pull_worker(model):
+    _PULL.update(active=True, status="starting...", model=model)
+    try:
+        data = json.dumps({"model": model, "stream": True}).encode("utf-8")
+        req = urllib.request.Request(OLLAMA_URL + "/api/pull", data=data,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=3600) as resp:
+            for raw in resp:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    o = json.loads(raw)
+                except Exception:
+                    continue
+                if o.get("error"):
+                    _PULL["status"] = "error: " + str(o["error"])
+                    continue
+                stt = o.get("status", "")
+                if o.get("total") and o.get("completed") is not None:
+                    pct = int(o["completed"] * 100 / max(o["total"], 1))
+                    _PULL["status"] = "%s %d%%" % (stt, pct)
+                elif stt:
+                    _PULL["status"] = stt
+        if not _PULL["status"].startswith("error"):
+            _PULL["status"] = "done"
+    except Exception as e:
+        _PULL["status"] = "error: %s" % e
+    finally:
+        _PULL["active"] = False
+
+
+def _pull_tick():
+    _redraw()
+    return 0.5 if _PULL["active"] else None
 
 
 # ---------------------------------------------------------------------------
@@ -866,9 +1044,10 @@ class Runtime:
 
     def reset(self, model="", user_input="", mode="AGENT", permission="accept",
               auto_retry=2, scene_snap="", step_vision=False, prefer_nodes=True,
-              use_polyhaven=True, safe_scan=True, memory_ctx=""):
+              use_polyhaven=True, safe_scan=True, memory_ctx="", extra_system=""):
         self.model = model
         self.memory_ctx = memory_ctx
+        self.extra_system = extra_system
         self.user_input = user_input
         self.mode = mode
         self.permission = permission
@@ -903,8 +1082,9 @@ class Runtime:
 
     def _ask_worker(self):
         try:
+            sysmsg = ASK_SYSTEM + (("\n\n" + self.extra_system) if self.extra_system else "")
             content = ollama_chat(self.model, [
-                {"role": "system", "content": ASK_SYSTEM},
+                {"role": "system", "content": sysmsg},
                 {"role": "user", "content": self.user_input},
             ], temperature=0.4)
             self.q.put(("ok", _strip_think(content)))
@@ -919,7 +1099,8 @@ class Runtime:
             sys_prompt = (PLAN_SYSTEM
                           + (PLAN_EXTRA if self.mode == "PLAN" else "")
                           + (PROC_EXTRA if self.prefer_nodes else "")
-                          + (PH_HELP if self.use_polyhaven else ""))
+                          + (PH_HELP if self.use_polyhaven else "")
+                          + (("\n\n" + self.extra_system) if self.extra_system else ""))
             umsg = self.user_input
             if include_scene and self.scene_snap:
                 umsg = umsg + "\n\n" + self.scene_snap
@@ -1274,8 +1455,7 @@ def _step_machine(st):
             _LAST_RUN["prompt"] = R.user_input
             _LAST_RUN["code"] = code
             _LAST_RUN["mode"] = R.mode
-            prefs = _get_prefs()
-            if prefs and prefs.auto_remember and R.mode == "AGENT" and code.strip():
+            if R.mode == "AGENT" and code.strip():
                 record_episode(R.user_input, code, R.mode, "auto")
         except Exception:
             pass
@@ -1321,24 +1501,49 @@ def model_items(self, context):
     return _MODEL_ITEMS
 
 
+EMBED_ITEMS = [
+    ("none", "None (keyword only)", "No embedding model; use fast keyword matching"),
+    ("nomic-embed-text", "nomic-embed-text (~274 MB)", "Small, fast, good general text embeddings"),
+    ("embeddinggemma", "embeddinggemma (~620 MB)", "Google EmbeddingGemma"),
+    ("mxbai-embed-large", "mxbai-embed-large (~670 MB)", "Higher quality, larger"),
+    ("bge-m3", "bge-m3 (~1.2 GB)", "Multilingual, high quality"),
+    ("all-minilm", "all-minilm (~46 MB)", "Tiny and fastest, lower quality"),
+]
+
+
 class AICtrlPreferences(bpy.types.AddonPreferences):
     bl_idname = __name__
     use_memory: BoolProperty(
         name="Use memory (RAG)", default=True,
-        description="Inject relevant past examples and your preferences into the AI prompt")
-    auto_remember: BoolProperty(
-        name="Auto-remember successful runs", default=True,
-        description="Automatically save successful Agent runs to your local memory")
-    pref_notes: StringProperty(
-        name="Preference notes", default="",
-        description="Standing habits always given to the AI (units, style, naming, ...)")
+        description="Inject relevant past examples into the AI prompt")
+    system_prompt: StringProperty(
+        name="System prompt", default="",
+        description="Extra standing instructions always added to the AI's system prompt "
+                    "(units, style, naming, ...)")
+    embed_model: EnumProperty(
+        name="Embedding model", default="none", items=EMBED_ITEMS,
+        description="Embedding model for semantic memory retrieval; None = keyword only")
 
     def draw(self, context):
         L = self.layout
         L.prop(self, "use_memory")
-        L.prop(self, "auto_remember")
-        L.label(text="Preference notes (always sent to the AI):")
-        L.prop(self, "pref_notes", text="")
+        L.label(text="Successful Agent runs are auto-saved to local memory.")
+        L.separator()
+        L.label(text="System prompt (always sent to the AI):")
+        L.prop(self, "system_prompt", text="")
+        L.separator()
+        L.label(text="Semantic retrieval (optional)")
+        row = L.row()
+        row.prop(self, "embed_model", text="Model")
+        row.label(text="In use: %s" % ("keyword" if self.embed_model == "none" else self.embed_model))
+        dr = L.row()
+        dr.enabled = (self.embed_model != "none") and (not _PULL["active"])
+        dr.operator("ai.pull_embed", icon='IMPORT')
+        if _PULL.get("status"):
+            L.label(text="Download: %s" % _PULL["status"])
+        L.label(text="Works without downloading — it falls back to keyword search.", icon='INFO')
+        L.label(text="Download fetches an Ollama model, not any Blender file.", icon='INFO')
+        L.label(text="Saved memories: %d" % count_episodes())
 
 
 class ReportItem(bpy.types.PropertyGroup):
@@ -1352,7 +1557,7 @@ class TodoItem(bpy.types.PropertyGroup):
 
 class AIProps(bpy.types.PropertyGroup):
     user_input: StringProperty(name="Prompt", description="Describe what you want in natural language", default="")
-    model: EnumProperty(name="Model", items=model_items)
+    model: EnumProperty(name="Model", items=model_items, update=_on_model_change)
     mode: EnumProperty(
         name="Mode", default="AGENT",
         items=[
@@ -1388,6 +1593,9 @@ class AIProps(bpy.types.PropertyGroup):
     task_name: StringProperty(default="")
     connected: BoolProperty(default=False)
     loaded_info: StringProperty(default="none")
+    caps: StringProperty(default="")
+    caps_known: BoolProperty(default=False)
+    model_vision: BoolProperty(default=False)
     is_running: BoolProperty(default=False)
     needs_decision: BoolProperty(default=False)
     needs_approve: BoolProperty(default=False)
@@ -1443,6 +1651,10 @@ class AI_OT_refresh(bpy.types.Operator):
         chosen = next((r for r in RECOMMENDED if r in names), names[0])
         try:
             st.model = chosen
+        except Exception:
+            pass
+        try:
+            refresh_caps(st)
         except Exception:
             pass
         st.loaded_info = loaded_text()
@@ -1506,12 +1718,17 @@ class AI_OT_run(bpy.types.Operator):
         snap = scene_snapshot() if st.mode == "AGENT" else ""
         prefs = _get_prefs()
         mem_ctx = ""
-        if prefs and prefs.use_memory and st.mode in ("PLAN", "AGENT"):
-            mem_ctx = build_memory_context(prefs.pref_notes, st.user_input)
+        extra_system = ""
+        if prefs:
+            extra_system = (prefs.system_prompt or "").strip()
+            if prefs.use_memory and st.mode in ("PLAN", "AGENT"):
+                mem_ctx = build_examples_context(st.user_input)
         R.reset(model=st.model, user_input=st.user_input, mode=st.mode,
                 permission=st.permission, auto_retry=st.auto_retry, scene_snap=snap,
-                step_vision=st.step_vision, prefer_nodes=st.prefer_nodes,
-                use_polyhaven=st.use_polyhaven, safe_scan=st.safe_scan, memory_ctx=mem_ctx)
+                step_vision=(st.step_vision and (st.model_vision or not st.caps_known)),
+                prefer_nodes=st.prefer_nodes,
+                use_polyhaven=st.use_polyhaven, safe_scan=st.safe_scan,
+                memory_ctx=mem_ctx, extra_system=extra_system)
         st.is_running = True
         st.needs_decision = False
         st.needs_approve = False
@@ -1614,6 +1831,27 @@ class AI_OT_mem_clear(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AI_OT_pull_embed(bpy.types.Operator):
+    bl_idname = "ai.pull_embed"
+    bl_label = "Download embedding model"
+    bl_description = "Download the embedding model via Ollama for semantic memory retrieval"
+
+    def execute(self, context):
+        prefs = _get_prefs()
+        name = getattr(prefs, "embed_model", "none") if prefs else "none"
+        if not name or name == "none":
+            self.report({'WARNING'}, "Pick an embedding model first")
+            return {'CANCELLED'}
+        if _PULL["active"]:
+            self.report({'WARNING'}, "A download is already running")
+            return {'CANCELLED'}
+        threading.Thread(target=_pull_worker, args=(name,), daemon=True).start()
+        if not bpy.app.timers.is_registered(_pull_tick):
+            bpy.app.timers.register(_pull_tick, first_interval=0.5)
+        self.report({'INFO'}, "Downloading %s ..." % name)
+        return {'FINISHED'}
+
+
 class AI_OT_clear(bpy.types.Operator):
     bl_idname = "ai.clear"
     bl_label = "Clear"
@@ -1657,6 +1895,7 @@ class AI_PT_panel(bpy.types.Panel):
         mrow.enabled = not running
         mrow.prop(st, "model", text="")
         box.label(text="Loaded: %s" % st.loaded_info)
+        box.label(text="Capabilities: %s" % (st.caps if st.caps else "(press Refresh)"))
         ur = box.row()
         ur.enabled = not running
         ur.operator("ai.unload", icon='UNLINKED')
@@ -1671,8 +1910,10 @@ class AI_PT_panel(bpy.types.Panel):
         mb.prop(st, "auto_retry")
         mb.prop(st, "safe_scan")
         vr = mb.row()
-        vr.enabled = (st.mode == "AGENT")
+        vr.enabled = (st.mode == "AGENT") and (st.model_vision or not st.caps_known)
         vr.prop(st, "step_vision")
+        if st.caps_known and not st.model_vision:
+            mb.label(text="vision check needs a vision model (e.g. qwen3.6)", icon='INFO')
         mb.prop(st, "prefer_nodes")
         mb.prop(st, "use_polyhaven")
 
@@ -1681,26 +1922,20 @@ class AI_PT_panel(bpy.types.Panel):
         bb.enabled = not running
         bb.operator("ai.beautify", icon='SHADING_RENDERED')
 
-        # Memory (RAG)
+        # Memory (RAG) — full settings live in Add-on Preferences
         prefs = _get_prefs()
         if prefs:
             memb = L.box()
             memb.label(text="Memory (RAG)", icon='PRESET')
-            mr = memb.row()
-            mr.enabled = not running
-            mr.prop(prefs, "use_memory")
-            mr2 = memb.row()
-            mr2.enabled = not running
-            mr2.prop(prefs, "auto_remember")
-            memb.label(text="Preferences (always sent):")
-            pn = memb.row()
-            pn.enabled = not running
-            pn.prop(prefs, "pref_notes", text="")
-            memb.label(text="Saved memories: %d" % count_episodes())
-            mrow = memb.row(align=True)
+            memb.label(text="On: %s    Saved: %d"
+                       % ("yes" if prefs.use_memory else "no", count_episodes()))
+            if _PULL.get("status"):
+                memb.label(text="Embed download: %s" % _PULL["status"])
+            memb.label(text="Auto-saves successful runs", icon='CHECKMARK')
+            mrow = memb.row()
             mrow.enabled = not running
-            mrow.operator("ai.mem_save", icon='ADD')
             mrow.operator("ai.mem_clear", icon='TRASH')
+            memb.label(text="Settings in Add-on Preferences", icon='PREFERENCES')
 
         # Prompt (locked while running)
         col = L.column()
@@ -1795,6 +2030,7 @@ CLASSES = (
     AI_OT_decide,
     AI_OT_mem_save,
     AI_OT_mem_clear,
+    AI_OT_pull_embed,
     AI_OT_clear,
     AI_PT_panel,
 )
@@ -1807,11 +2043,12 @@ def register():
 
 
 def unregister():
-    try:
-        if bpy.app.timers.is_registered(_tick):
-            bpy.app.timers.unregister(_tick)
-    except Exception:
-        pass
+    for _t in (_tick, _pull_tick):
+        try:
+            if bpy.app.timers.is_registered(_t):
+                bpy.app.timers.unregister(_t)
+        except Exception:
+            pass
     if hasattr(bpy.types.Scene, "ai_props"):
         del bpy.types.Scene.ai_props
     for cls in reversed(CLASSES):

@@ -16,6 +16,9 @@ Thumbs.db
 dist/
 build/
 
-# Runtime temp produced by the add-on (lives in the system temp dir, listed for safety)
+# Runtime / per-machine files produced by the add-on.
+# These normally live in Blender's config dir (outside this repo), listed here for safety.
 blender_ai_view_*
 blender_ai_polyhaven/
+episodes.jsonl
+emb_*.json
