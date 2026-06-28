@@ -40,7 +40,7 @@ Interaction:
 bl_info = {
     "name": "Blender AI Controller (Ollama)",
     "author": "Z1jay",
-    "version": (4, 0, 0),
+    "version": (4, 1, 0),
     "blender": (4, 1, 0),
     "location": "View3D > Sidebar (N) > AI",
     "description": "Copilot-style local-AI control for Blender via Ollama (Ask/Plan/Agent, with per-step vision).",
@@ -349,6 +349,110 @@ def loaded_text():
 
 def unload_model(name):
     _post("/api/generate", {"model": name, "keep_alive": 0})
+
+
+# ---------------------------------------------------------------------------
+# Local memory / RAG (keyword retrieval; pure Python, no extra deps)
+#   - Seed KB shipped in kb/seed.jsonl
+#   - User episodic memory appended to the addon config dir
+#   - Preference notes live in AddonPreferences (always injected)
+# ---------------------------------------------------------------------------
+_LAST_RUN = {"prompt": "", "code": "", "mode": ""}
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|[一-鿿]")
+
+
+def _mem_dir():
+    try:
+        return bpy.utils.user_resource('CONFIG', path="blender_ai_controller", create=True)
+    except Exception:
+        return tempfile.gettempdir()
+
+
+def _episodes_path():
+    return os.path.join(_mem_dir(), "episodes.jsonl")
+
+
+def _tokens(s):
+    return set(w.lower() for w in _WORD_RE.findall(s or ""))
+
+
+def _load_memory_items():
+    items = []
+    seed = os.path.join(os.path.dirname(__file__), "kb", "seed.jsonl")
+    for path in (seed, _episodes_path()):
+        try:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            items.append(json.loads(line))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return items
+
+
+def retrieve_memory(query, k=3):
+    qt = _tokens(query)
+    if not qt:
+        return []
+    scored = []
+    for it in _load_memory_items():
+        pt = _tokens(it.get("prompt", ""))
+        if not pt:
+            continue
+        overlap = len(qt & pt)
+        if overlap:
+            scored.append((overlap / (len(pt) ** 0.5), it))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [it for _, it in scored[:k]]
+
+
+def record_episode(prompt, code, mode, source="auto"):
+    if not (prompt and code):
+        return
+    try:
+        with open(_episodes_path(), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"prompt": prompt, "code": code, "mode": mode,
+                                "source": source}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def count_episodes():
+    try:
+        p = _episodes_path()
+        if not os.path.exists(p):
+            return 0
+        with open(p, encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0
+
+
+def build_memory_context(pref_notes, user_input):
+    parts = []
+    notes = (pref_notes or "").strip()
+    if notes:
+        parts.append("User standing preferences (always follow):\n" + notes)
+    eps = retrieve_memory(user_input, k=3)
+    if eps:
+        ex = "\n\n".join("# Past task: %s\n%s" % (e.get("prompt", ""), e.get("code", ""))
+                         for e in eps)
+        parts.append("Relevant examples that worked before on this machine "
+                     "(reuse patterns that fit, adapt as needed):\n" + ex)
+    return "\n\n".join(parts)
+
+
+def _get_prefs():
+    try:
+        return bpy.context.preferences.addons[__name__].preferences
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -762,8 +866,9 @@ class Runtime:
 
     def reset(self, model="", user_input="", mode="AGENT", permission="accept",
               auto_retry=2, scene_snap="", step_vision=False, prefer_nodes=True,
-              use_polyhaven=True, safe_scan=True):
+              use_polyhaven=True, safe_scan=True, memory_ctx=""):
         self.model = model
+        self.memory_ctx = memory_ctx
         self.user_input = user_input
         self.mode = mode
         self.permission = permission
@@ -818,6 +923,8 @@ class Runtime:
             umsg = self.user_input
             if include_scene and self.scene_snap:
                 umsg = umsg + "\n\n" + self.scene_snap
+            if self.memory_ctx:
+                umsg = self.memory_ctx + "\n\n---\n\n" + umsg
             content = ollama_chat(self.model, [
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": umsg},
@@ -1162,6 +1269,16 @@ def _step_machine(st):
             return True
         kind, payload = msg
         report_add(st, "Summary: " + (payload if kind == "ok" else "(summary failed)"))
+        try:
+            code = "\n\n".join(s.get("code", "") for s in R.steps)
+            _LAST_RUN["prompt"] = R.user_input
+            _LAST_RUN["code"] = code
+            _LAST_RUN["mode"] = R.mode
+            prefs = _get_prefs()
+            if prefs and prefs.auto_remember and R.mode == "AGENT" and code.strip():
+                record_episode(R.user_input, code, R.mode, "auto")
+        except Exception:
+            pass
         _finish_run(st, "Done")
         return False
 
@@ -1202,6 +1319,26 @@ def _tick():
 # ---------------------------------------------------------------------------
 def model_items(self, context):
     return _MODEL_ITEMS
+
+
+class AICtrlPreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+    use_memory: BoolProperty(
+        name="Use memory (RAG)", default=True,
+        description="Inject relevant past examples and your preferences into the AI prompt")
+    auto_remember: BoolProperty(
+        name="Auto-remember successful runs", default=True,
+        description="Automatically save successful Agent runs to your local memory")
+    pref_notes: StringProperty(
+        name="Preference notes", default="",
+        description="Standing habits always given to the AI (units, style, naming, ...)")
+
+    def draw(self, context):
+        L = self.layout
+        L.prop(self, "use_memory")
+        L.prop(self, "auto_remember")
+        L.label(text="Preference notes (always sent to the AI):")
+        L.prop(self, "pref_notes", text="")
 
 
 class ReportItem(bpy.types.PropertyGroup):
@@ -1367,10 +1504,14 @@ class AI_OT_run(bpy.types.Operator):
             return {'CANCELLED'}
 
         snap = scene_snapshot() if st.mode == "AGENT" else ""
+        prefs = _get_prefs()
+        mem_ctx = ""
+        if prefs and prefs.use_memory and st.mode in ("PLAN", "AGENT"):
+            mem_ctx = build_memory_context(prefs.pref_notes, st.user_input)
         R.reset(model=st.model, user_input=st.user_input, mode=st.mode,
                 permission=st.permission, auto_retry=st.auto_retry, scene_snap=snap,
                 step_vision=st.step_vision, prefer_nodes=st.prefer_nodes,
-                use_polyhaven=st.use_polyhaven, safe_scan=st.safe_scan)
+                use_polyhaven=st.use_polyhaven, safe_scan=st.safe_scan, memory_ctx=mem_ctx)
         st.is_running = True
         st.needs_decision = False
         st.needs_approve = False
@@ -1442,6 +1583,37 @@ class AI_OT_decide(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AI_OT_mem_save(bpy.types.Operator):
+    bl_idname = "ai.mem_save"
+    bl_label = "Save last run"
+    bl_description = "Save the last successful run to your local memory"
+
+    def execute(self, context):
+        if not _LAST_RUN.get("code"):
+            self.report({'WARNING'}, "No successful run to save yet")
+            return {'CANCELLED'}
+        record_episode(_LAST_RUN["prompt"], _LAST_RUN["code"], _LAST_RUN.get("mode", "AGENT"), "saved")
+        self.report({'INFO'}, "Saved to memory")
+        return {'FINISHED'}
+
+
+class AI_OT_mem_clear(bpy.types.Operator):
+    bl_idname = "ai.mem_clear"
+    bl_label = "Clear memory"
+    bl_description = "Delete your saved memories (the shipped seed examples are kept)"
+
+    def execute(self, context):
+        try:
+            p = _episodes_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            self.report({'ERROR'}, "%s" % e)
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Memory cleared")
+        return {'FINISHED'}
+
+
 class AI_OT_clear(bpy.types.Operator):
     bl_idname = "ai.clear"
     bl_label = "Clear"
@@ -1508,6 +1680,27 @@ class AI_PT_panel(bpy.types.Panel):
         bb = L.row()
         bb.enabled = not running
         bb.operator("ai.beautify", icon='SHADING_RENDERED')
+
+        # Memory (RAG)
+        prefs = _get_prefs()
+        if prefs:
+            memb = L.box()
+            memb.label(text="Memory (RAG)", icon='PRESET')
+            mr = memb.row()
+            mr.enabled = not running
+            mr.prop(prefs, "use_memory")
+            mr2 = memb.row()
+            mr2.enabled = not running
+            mr2.prop(prefs, "auto_remember")
+            memb.label(text="Preferences (always sent):")
+            pn = memb.row()
+            pn.enabled = not running
+            pn.prop(prefs, "pref_notes", text="")
+            memb.label(text="Saved memories: %d" % count_episodes())
+            mrow = memb.row(align=True)
+            mrow.enabled = not running
+            mrow.operator("ai.mem_save", icon='ADD')
+            mrow.operator("ai.mem_clear", icon='TRASH')
 
         # Prompt (locked while running)
         col = L.column()
@@ -1588,6 +1781,7 @@ class AI_PT_panel(bpy.types.Panel):
 # Register
 # ---------------------------------------------------------------------------
 CLASSES = (
+    AICtrlPreferences,
     ReportItem,
     TodoItem,
     AIProps,
@@ -1599,6 +1793,8 @@ CLASSES = (
     AI_OT_stop,
     AI_OT_beautify,
     AI_OT_decide,
+    AI_OT_mem_save,
+    AI_OT_mem_clear,
     AI_OT_clear,
     AI_PT_panel,
 )
